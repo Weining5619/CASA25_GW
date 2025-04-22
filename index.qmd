@@ -36,18 +36,599 @@ Replace the link below with the link to your application.
 
 ## How it Works
 
-Use this section to explain how your application works using code blocks and text explanations (no more than 500 words excluding code):
+### Section A: Data Setting  
 
-``` js
-Map.setCenter(35.51898, 33.90153, 15);
+`A1` initialises the map view at coordinates (120°E, 40°N) with `Map.setCenter(120, 40, 4)` and sets the basemap to satellite imagery via `Map.setOptions('SATELLITE')` for high-resolution land-cover visualization. 
 
-Map.setOptions("satellite");
+```js
+// A1: Map Setup
 
-var aoi = ee.Geometry.Point(35.51898, 33.90153).buffer(3000);
+Map.setCenter(120, 40, 4);
+Map.setOptions('SATELLITE');
 ```
 
-You can include images:
+`A2` imports crane GPS data (`cleaned_crane_below100`), administrative boundaries (`countries`, `provinces`), protected areas (`natural_reserves`), and the area with cranes detected (`convex_hull`) using `ee.FeatureCollection`. Timestamps are added to crane data with `.set('system:time_start')` for the temporal analysis later.  
 
-![Pixelwise T-Test, 2018](images/beirut_change_2020.jpg)
+```js
+// A2: Data Imports
 
-and math: $$ \Large t = {\frac{\overline{x_1}-\overline{x_2}} {\sqrt{\frac{s^2_1}{n_1} + \frac{s^2_2}{n_2}}}} $$
+var cranes = ee.FeatureCollection('projects/casa25gw/assets/cleaned_crane_below100')
+    .map(function(f) {
+        return f.set('system:time_start', f.get('timestamp'));
+    });
+var convex_hull = ee.FeatureCollection('projects/casa25gw/assets/convex_hull');
+var natural_reserves = ee.FeatureCollection('projects/casa25gw/assets/natural_reserves');
+var countries = ee.FeatureCollection('FAO/GAUL/2015/level0');
+var provinces = ee.FeatureCollection('FAO/GAUL/2015/level1');
+```
+
+`A3` defines `maskS2clouds(image)` to remove cloud pixels using Sentinel-2’s `QA60` band (bitwise checks for cloud shadows/cirrus) or legacy `MSK_CLASSI` bands. 
+
+```js
+// A3: Sentinel‑2 Mask Function
+
+function maskS2clouds(image) {
+    var names = image.bandNames();
+    var mask = ee.Image(ee.Algorithms.If(
+        names.contains('QA60'),
+        image.select('QA60')
+        .bitwiseAnd(1 << 10).eq(0)
+        .and(image.select('QA60')
+            .bitwiseAnd(1 << 11).eq(0)),
+        image.select('MSK_CLASSI_OPAQUE').eq(0)
+        .and(image.select('MSK_CLASSI_CIRRUS').eq(0))
+        .and(image.select('MSK_CLASSI_SNOW_ICE').eq(0))
+    ));
+    return image.updateMask(mask)
+        .select('B.*')
+        .copyProperties(image, ['system:time_start']);
+    }
+```
+
+`A4` aggregates 2018–2021 seasonal environmental data: NDVI (MODIS, scaled ×0.0001), temperature (ERA5, converted from Kelvin), NO2 (Copernicus), and water presence (JRC). Uses `safeMeanWithFallback` to compute seasonal means, defaulting to annual averages if data is sparse. Clips results to `convex_hull` to constrain analysis to the crane migration corridor.  
+
+```js
+// A4: Environmental Layers
+
+var envStart = ee.Date('2018-01-01'),
+    envEnd = ee.Date('2021-12-31');
+var ndviCol = ee.ImageCollection('MODIS/061/MOD13A1')
+    .filterDate(envStart, envEnd).select('NDVI');
+var tempCol = ee.ImageCollection('ECMWF/ERA5/DAILY')
+    .filterDate(envStart, envEnd).select('mean_2m_air_temperature');
+var no2Col = ee.ImageCollection('COPERNICUS/S5P/OFFL/L3_NO2')
+    .filterDate(envStart, envEnd).select('tropospheric_NO2_column_number_density');
+var waterCol = ee.ImageCollection('JRC/GSW1_4/MonthlyHistory')
+    .filterDate(envStart, envEnd);
+var seasons = {
+    Winter: ee.Filter.or(
+        ee.Filter.calendarRange(12, 12, 'month'),
+        ee.Filter.calendarRange(1, 2, 'month')),
+    Spring: ee.Filter.calendarRange(3, 5, 'month'),
+    Summer: ee.Filter.calendarRange(6, 8, 'month'),
+    Autumn: ee.Filter.calendarRange(9, 11, 'month')
+    };
+var seasonNames = ee.List(['Winter', 'Spring', 'Summer', 'Autumn']);
+function safeMeanWithFallback(seasonCol, annualCol) {
+    return ee.Image(ee.Algorithms.If(
+        seasonCol.size().gt(0), seasonCol.mean(), annualCol.mean()
+    ));
+    }
+var annual = {
+    NDVI: ndviCol,
+    Temp: tempCol,
+    NO2: no2Col
+    };
+
+var envComposites = ee.Dictionary({
+    'Winter': {
+        NDVI: safeMeanWithFallback(ndviCol.filter(seasons.Winter), annual.NDVI)
+            .multiply(0.0001).rename('NDVI').clip(convex_hull),
+        Temp: safeMeanWithFallback(tempCol.filter(seasons.Winter), annual.Temp)
+            .subtract(273.15).rename('Temp').clip(convex_hull),
+        NO2: safeMeanWithFallback(no2Col.filter(seasons.Winter), annual.NO2)
+            .rename('NO2').clip(convex_hull),
+        Water: waterCol.filter(seasons.Winter)
+            .map(function(img) {
+                var valid = img.select('water').neq(0);
+                return img.select('water').eq(2).updateMask(valid);
+            })
+            .sum()
+            .divide(waterCol.filter(seasons.Winter).count())
+            .rename('Water')
+            .clip(convex_hull)
+    },
+    'Spring': {
+        NDVI: safeMeanWithFallback(ndviCol.filter(seasons.Spring), annual.NDVI)
+            .multiply(0.0001).rename('NDVI').clip(convex_hull),
+        Temp: safeMeanWithFallback(tempCol.filter(seasons.Spring), annual.Temp)
+            .subtract(273.15).rename('Temp').clip(convex_hull),
+        NO2: safeMeanWithFallback(no2Col.filter(seasons.Spring), annual.NO2)
+            .rename('NO2').clip(convex_hull),
+        Water: waterCol.filter(seasons.Spring)
+            .map(function(img) {
+                var valid = img.select('water').neq(0);
+                return img.select('water').eq(2).updateMask(valid);
+            })
+            .sum()
+            .divide(waterCol.filter(seasons.Spring).count())
+            .rename('Water')
+            .clip(convex_hull)
+    },
+    'Summer': {
+        NDVI: safeMeanWithFallback(ndviCol.filter(seasons.Summer), annual.NDVI)
+            .multiply(0.0001).rename('NDVI').clip(convex_hull),
+        Temp: safeMeanWithFallback(tempCol.filter(seasons.Summer), annual.Temp)
+            .subtract(273.15).rename('Temp').clip(convex_hull),
+        NO2: safeMeanWithFallback(no2Col.filter(seasons.Summer), annual.NO2)
+            .rename('NO2').clip(convex_hull),
+        Water: waterCol.filter(seasons.Summer)
+            .map(function(img) {
+                var valid = img.select('water').neq(0);
+                return img.select('water').eq(2).updateMask(valid);
+            })
+            .sum()
+            .divide(waterCol.filter(seasons.Summer).count())
+            .rename('Water')
+            .clip(convex_hull)
+    },
+    'Autumn': {
+        NDVI: safeMeanWithFallback(ndviCol.filter(seasons.Autumn), annual.NDVI)
+            .multiply(0.0001).rename('NDVI').clip(convex_hull),
+        Temp: safeMeanWithFallback(tempCol.filter(seasons.Autumn), annual.Temp)
+            .subtract(273.15).rename('Temp').clip(convex_hull),
+        NO2: safeMeanWithFallback(no2Col.filter(seasons.Autumn), annual.NO2)
+            .rename('NO2').clip(convex_hull),
+        Water: waterCol.filter(seasons.Autumn)
+            .map(function(img) {
+                var valid = img.select('water').neq(0);
+                return img.select('water').eq(2).updateMask(valid);
+            })
+            .sum()
+            .divide(waterCol.filter(seasons.Autumn).count())
+            .rename('Water')
+            .clip(convex_hull)
+    }
+    });
+```
+
+### Section B: Hotspot Extraction  
+
+`B1` generates a density raster using a Gaussian kernel (10 km radius) applied to crane points via `.reduceToImage(['count'])`. Reprojects to 1 km resolution (`EPSG:4326`) to balance detail and processing efficiency.  
+
+```js
+// B1: Kernel & Density Image
+
+var kernel = ee.Kernel.gaussian({
+    radius: 10000,
+    sigma: 10000,
+    units: 'meters'
+    });
+    
+var densityImage = cranes
+    .map(function(f) {
+        return f.set('count', 1);
+    })
+    .reduceToImage(['count'], ee.Reducer.sum())
+    .convolve(kernel)
+    .reproject('EPSG:4326', null, 1000)
+    .clip(convex_hull);
+```
+
+`B2` computes the 90th percentile density threshold over `convex_hull` with `reduceRegion`, isolating the top 10% of high-density areas.  
+```js
+// B2: Threshold Calculation
+
+var threshold = densityImage
+    .reduceRegion({
+        reducer: ee.Reducer.percentile([90]),
+        geometry: convex_hull,
+        scale: 1000,
+        bestEffort: true
+    })
+    .values()
+    .getNumber(0);
+```
+
+`B3` converts threshold-exceeding pixels to polygons using `reduceToVectors`, buffers them by 300 m to account for GPS uncertainty, and enriches with the following attributes for each hotspot polygon:  
+- `peakSeason`: Derived via `.filter(seasons)` to identify the season with maximum crane counts.  
+- `totalCranes`: Total observations per polygon.  
+- `inReserve`: Checks overlap with `natural_reserves`.  
+
+```js
+// B3: Vectorize & Enrich Hotspots
+
+var hotspotPolygons = densityImage
+    .gte(threshold)
+    .selfMask()
+    .reduceToVectors({
+        geometry: convex_hull,
+        scale: 500,
+        geometryType: 'polygon',
+        eightConnected: true,
+        reducer: ee.Reducer.countEvery()
+    })
+    .map(function(f) {
+        return f.buffer(300);
+    });
+    
+var enrichedHotspots = hotspotPolygons.map(function(poly) {
+    var g = poly.geometry();
+    var counts = seasonNames.map(function(s) {
+        return cranes
+            .filter(ee.Dictionary(seasons).get(s))
+            .filterBounds(g)
+            .size();
+    });
+    var total = cranes.filterBounds(g).size();
+    var peak = seasonNames.get(
+        ee.List(counts).indexOf(ee.List(counts).reduce(ee.Reducer.max()))
+    );
+    var inRes = natural_reserves.filterBounds(g).size().gt(0);
+    return poly.set({
+            peakSeason: peak,
+            totalCranes: total,
+            inReserve: inRes
+        })
+        .setGeometry(poly.geometry().transform('EPSG:4326', 1));
+        });
+```
+
+`B4` styles map layers: `countryBorder` (black lines), `natural_reserves` (green semi-transparent polygons), and `enrichedHotspots` (red semi-transparent polygons) using `Map.addLayer`.  
+
+```js
+// B4: Core Layers (Map Styling)
+
+Map.addLayer(
+  natural_reserves.style({
+    color: '#006400',
+    fillColor: '#00640088',
+    width: 1
+  }),
+  {},
+  'Nature Reserves',
+  true
+  );
+  
+var countryBorder = ee.Image().byte().paint({
+  featureCollection: countries.filterBounds(cranes.geometry()),
+  color: 1,
+  width: 2
+  });
+  
+Map.addLayer(
+  countryBorder,
+  { palette: ['black'] },
+  'Country Border',
+  true
+  );
+  
+var corridorOutline = ee.Image().byte().paint({
+  featureCollection: convex_hull,
+  color: 1,
+  width: 2
+  });
+  
+Map.addLayer(
+  corridorOutline,
+  { palette: ['white'] },
+  'Migration Corridor',
+  true
+  );
+  
+Map.addLayer(
+  enrichedHotspots.style({
+    color: 'red',
+    fillColor: '#FF000088',
+    width: 2
+  }),
+  {},
+  'Crane Hotspot (90th percentile)',
+  true
+);
+```
+
+### Section C: UI Design 
+
+`C1` creates a collapsible `ui.Panel` (350px width, top-left position) with a title, description, and data link. Uses CSS for readability (`borderRadius: '6px'`).  
+
+```js
+// C1: Main UI Panel Setup
+
+var mainPanel = ui.Panel({
+  layout: ui.Panel.Layout.flow('vertical'),
+  style: {
+    position:       'top-left',       
+    padding:        '8px',
+    backgroundColor:'white',
+    border:         '1px solid #666',
+    borderRadius:   '6px',
+    width:          '350px',
+    maxHeight:      '80%'            
+  }
+  });
+
+mainPanel.add(ui.Label(
+  'Mapping Crane Density Hotspots to Guide Off‑Reserve Conservation',
+  { fontWeight:'bold', fontSize:'20px' }
+  ));
+mainPanel.add(ui.Label(
+  'This application maps 90th‑percentile, high‑density crane hotspots, many of which lie outside formally protected reserves, to inform off‑reserve conservation planning by displaying each hotspot’s peak‑season environmental drivers of habitat suitability. The dataset spans August 2013 through April 2021.',
+  { whiteSpace:'wrap', color:'gray', fontStyle:'italic', fontSize:'13px' }
+  ));
+
+var dataLink = ui.Label(
+  'Click here for the crane source data (Batbayar et al. 2024)',
+  {
+    fontSize:       '12px',
+    color:          'blue',
+    fontStyle:      'italic',
+    textDecoration: 'underline'
+  },
+  {
+    targetUrl: 'https://datarepository.movebank.org/entities/datapackage/1e31df42-edfa-4225-b923-d8b0de83ab20'
+  }
+);
+mainPanel.add(dataLink);
+```
+
+`C2` populates `countrySelect` and `provinceSelect` dynamically using `.aggregate_array('ADM0_NAME')`, filtering jurisdictions intersecting `hotspotPolygons` to avoid users being overwhelmed with a long list of jurisdictions irrelevant to the task.
+
+```js
+// C2: Region Selector Sub‑Panel
+
+var regionPanel = ui.Panel({
+  layout: ui.Panel.Layout.flow('vertical'),
+  style: { margin:'8px 0 0 0' }
+});
+
+mainPanel.add(regionPanel);
+regionPanel.add(ui.Label(
+  'Step 1: Select Your Region',
+  { fontWeight:'bold', fontSize:'14px' }
+));
+regionPanel.add(ui.Label(
+  'First choose a country to zoom in, then pick a province. The layers may take up to one minute to fully process after each click.',
+  { whiteSpace:'wrap', fontSize:'12px' }
+));
+
+var countrySelect  = ui.Select({ placeholder:'Select Country' });
+var provinceSelect = ui.Select({ placeholder:'Select Province' });
+regionPanel.add(ui.Label('Country:',  { fontWeight:'bold', fontSize:'12px' }));
+regionPanel.add(countrySelect);
+regionPanel.add(ui.Label('Province:', { fontWeight:'bold', fontSize:'12px' }));
+regionPanel.add(provinceSelect);
+```
+
+`C3` adds a `homeButton` to reset the map/UI and formats metadata displays as tables with `addInfoRow`.  
+
+```js
+// C3: Info Panel & Home Button
+
+var infoPanel = ui.Panel({ layout: ui.Panel.Layout.flow('vertical') });
+mainPanel.add(infoPanel);
+
+var homeButton = ui.Button({
+  label: 'Home',
+  style: { stretch:'horizontal', margin:'8px 0 0 0' },
+  onClick: function() {
+    Map.setCenter(120, 40, 4);
+    Map.setOptions('SATELLITE');
+    Map.layers().forEach(function(l){
+      if (l.getName()==='Province Outline') Map.remove(l);
+    });
+    regionPanel.clear();
+    regionPanel.add(ui.Label(
+      'Step 1: Select Your Region',
+      { fontWeight:'bold', fontSize:'18px' }
+    ));
+    regionPanel.add(ui.Label(
+      'First choose a country to zoom in, then pick a province. The layers may take up to one minute to fully process after each click.',
+      { whiteSpace:'wrap', fontSize:'12px' }
+    ));
+    regionPanel.add(ui.Label('Country:',  { fontWeight:'bold', fontSize:'12px' }));
+    regionPanel.add(countrySelect);
+    regionPanel.add(ui.Label('Province:', { fontWeight:'bold', fontSize:'12px' }));
+    regionPanel.add(provinceSelect);
+    infoPanel.clear();
+    mainPanel.remove(homeButton);
+  }
+});
+
+Map.add(mainPanel);
+
+function addInfoRow(name, widget) {
+  infoPanel.add(ui.Panel([
+    ui.Label(name + ':', { fontWeight:'bold', fontSize:'12px' }),
+    widget
+  ], ui.Panel.Layout.flow('horizontal')));
+}
+```
+
+`C4-C5`** Updates province options and overlays province boundaries (`provincesOutlineImage`) on country selection for more detailed jurisdiction selection.
+
+```js
+// C4: Populate countries (Step 1)
+
+var hotspotCountries = countries.filterBounds(hotspotPolygons.geometry());
+hotspotCountries.aggregate_array('ADM0_NAME')
+  .distinct().sort()
+  .evaluate(function(list) {
+    countrySelect.items().reset(list);
+  });
+
+// C5: Switch from countries to provinces (Step 1)
+
+countrySelect.onChange(function(countryName) {
+  var provs = provinces
+    .filter(ee.Filter.eq('ADM0_NAME', countryName))
+    .filterBounds(hotspotPolygons.geometry())
+    .aggregate_array('ADM1_NAME')
+    .distinct()
+    .sort();
+
+  provs.evaluate(function(list) {
+    if (Array.isArray(list) && list.length) {
+      provinceSelect.items().reset(list);
+    } else {
+      provinceSelect.items().reset(['(No provinces)']);
+    }
+  });
+
+  var selectedCountryFeatures = hotspotCountries.filter(
+    ee.Filter.eq('ADM0_NAME', countryName)
+  );
+  Map.centerObject(selectedCountryFeatures, 5);
+
+  Map.layers().forEach(function(layer) {
+    if (layer.getName() === 'Province Outline') {
+      Map.remove(layer);
+    }
+  });
+
+  var provincesOutlineImage = ee.Image().byte().paint({
+    featureCollection: provinces.filter(ee.Filter.eq('ADM0_NAME', countryName)),
+    color: 1,
+    width: 1
+  });
+  Map.addLayer(
+    provincesOutlineImage,
+    { palette: ['black'] },
+    'Province Outline',
+    true
+  );
+});
+```
+
+`C6` prepares UI placeholders for environmental metrics (NDVI, Temp, etc.) but only computes values on hotspot click to avoid resource waste.  
+
+```js
+// C6: Switch from provinces to info extraction (Step 2) 
+
+provinceSelect.onChange(function(provinceName) {
+  if (provinceName === '(No provinces)') return;
+  Map.centerObject(
+    provinces.filter(ee.Filter.eq('ADM1_NAME', provinceName)),
+    8
+  );
+  regionPanel.clear();
+  regionPanel.add(ui.Label(
+    'Step 2: Retrieve Hotspot Info',
+    { fontWeight:'bold', fontSize:'18px' }
+  ));
+  regionPanel.add(ui.Label(
+    'Click any hotspot to retrieve the its crane peak season, total cranes detected, and four important environmental components known to be important to aspects of crane natural history (Batbayar et al., 2024). The layers loading and computation may take up to one minute to process.',
+    { whiteSpace:'wrap', fontSize:'12px' }
+  ));
+  regionPanel.add(ui.Label('Peak Season:',      { fontWeight:'bold', fontSize:'12px' }));
+  regionPanel.add(ui.Label('Season with maximum crane density in the hotspot.', { whiteSpace:'wrap', fontSize:'12px' }));
+  regionPanel.add(ui.Label('Total Cranes:',      { fontWeight:'bold', fontSize:'12px' }));
+  regionPanel.add(ui.Label('Number of crane observations recorded in the hotspot.', { whiteSpace:'wrap', fontSize:'12px' }));
+  regionPanel.add(ui.Label('In Reserve:',       { fontWeight:'bold', fontSize:'12px' }));
+  regionPanel.add(ui.Label('Whether the hotspot overlaps a protected nature reserve.', { whiteSpace:'wrap', fontSize:'12px' }));
+  regionPanel.add(ui.Label('Average NDVI (Normalized Difference Vegetation Index):',     { fontWeight:'bold', fontSize:'12px' }));
+  regionPanel.add(ui.Label('Mean NDVI during peak season (2018–2021).', { whiteSpace:'wrap', fontSize:'12px' }));
+  regionPanel.add(ui.Label('Average Temp (°C):',{ fontWeight:'bold', fontSize:'12px' }));
+  regionPanel.add(ui.Label('Mean 2 m air temperature during peak season (2018–2021).',{ whiteSpace:'wrap', fontSize:'12px' }));
+  regionPanel.add(ui.Label('Average NO2:',      { fontWeight:'bold', fontSize:'12px' }));
+  regionPanel.add(ui.Label('Mean tropospheric NO2 column density during peak season (2018–2021).',{ whiteSpace:'wrap', fontSize:'12px' }));
+  regionPanel.add(ui.Label('Water Fraction:',   { fontWeight:'bold', fontSize:'12px' }));
+  regionPanel.add(ui.Label('Proportion of surface water presence during peak season (2018–2021).',{ whiteSpace:'wrap', fontSize:'12px' }));
+  
+});
+```
+
+`C7` triggers on map click:  
+- Validates clicks on hotspots via `enrichedHotspots.filterBounds(pt).first()`.  
+- Computes environmental metrics using `reduceRegion` on a 500m buffer, with scale-dependent sampling (30m for water, 1000m for Temp/NO2).  
+- Formats results: NO2 in scientific notation, NDVI to 3 decimals.  
+
+```js
+// C7: Map click (Step 2)
+
+Map.onClick(function(coords) {
+  regionPanel.clear();                
+  infoPanel.clear();
+  var pt = ee.Geometry.Point([coords.lon, coords.lat]);
+  enrichedHotspots.filterBounds(pt).first().evaluate(function(f) {
+    if (!f) {
+      infoPanel.add(ui.Label('No hotspot here.'));
+    } else {
+      infoPanel.add(ui.Label(
+        'Hotspot Info',
+        { fontWeight:'bold', fontSize:'16px'}
+      ));
+      addInfoRow('- Peak Season',    ui.Label(f.properties.peakSeason));
+      addInfoRow('- Total Cranes',    ui.Label(f.properties.totalCranes));
+      addInfoRow('- In Reserve',      ui.Label(f.properties.inReserve?'Yes':'No'));
+      var placeholders = {};
+      [
+        {band:'NDVI', key:'- Average NDVI',     scale:500},
+        {band:'Temp', key:'- Average Temp (°C)',scale:1000},
+        {band:'NO2',  key:'- Average NO2',      scale:1000},
+        {band:'Water',key:'- Water Fraction',    scale:30}
+      ].forEach(function(o) {
+        var lbl = ui.Label('Calculating…');
+        placeholders[o.key] = lbl;
+        addInfoRow(o.key, lbl);
+      });
+      var dict = ee.Dictionary(envComposites.get(f.properties.peakSeason));
+      [
+        {band:'NDVI', key:'- Average NDVI',     scale:500},
+        {band:'Temp', key:'- Average Temp (°C)',scale:1000},
+        {band:'NO2',  key:'- Average NO2',      scale:1000},
+        {band:'Water',key:'- Water Fraction',    scale:30}
+      ].forEach(function(o) {
+        ee.Image(dict.get(o.band)).reduceRegion({
+          reducer: ee.Reducer.mean(),
+          geometry: pt.buffer(500),
+          scale:    o.scale,
+          maxPixels:1e9
+        }).evaluate(function(val) {
+          var raw = val && val[o.band];
+          var num = raw === null ? null : Number(raw);
+          var txt = num === null ? 'N/A'
+            : (o.key==='- Average NO2'
+               ? num.toExponential(2)
+               : num.toFixed(o.key==='- Average NDVI'?3:2));
+          placeholders[o.key].setValue(txt);
+        });
+      });
+    }
+    mainPanel.add(homeButton);
+  });
+});
+```
+
+`C8` adds a legend via `makeLegendSymbol`, using red (hotspots), white (corridor), and green (reserves) symbols positioned at the bottom-right. 
+
+```js
+// C8: Legend
+
+var legend = ui.Panel({
+  style: {
+    position: 'bottom-right', padding: '8px', backgroundColor: 'white'
+  }
+});
+legend.add(ui.Label('Legend',
+  {fontWeight:'bold', fontSize:'16px', margin:'0 0 4px 0'}
+));
+
+function makeLegendSymbol(fillColor, borderColor, name) {
+  return ui.Panel([
+    ui.Label('', {
+      backgroundColor: fillColor,
+      padding: '8px',
+      margin:  '0 0 4px 0',
+      width:   '18px',
+      height:  '18px',
+      border:  '1px solid ' + borderColor
+    }),
+    ui.Label(name, {margin:'0 0 4px 6px'})
+  ], ui.Panel.Layout.flow('horizontal'));
+}
+legend.add(makeLegendSymbol('rgba(255,0,0,0.53)', '#FF0000', 'Crane Hotspot'))
+      .add(makeLegendSymbol('#FFFFFF',         '#000000', 'Migration Corridor'))
+      .add(makeLegendSymbol('rgba(0,100,0,0.53)', '#006400', 'Nature Reserves'));
+Map.add(legend);
+```
