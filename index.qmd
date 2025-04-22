@@ -216,6 +216,7 @@ var densityImage = cranes
 ```
 
 `B2` computes the 90th percentile density threshold over `convex_hull` with `reduceRegion`, isolating the top 10% of high-density areas.  
+
 ```js
 // B2: Threshold Calculation
 
@@ -231,9 +232,9 @@ var threshold = densityImage
 ```
 
 `B3` converts threshold-exceeding pixels to polygons using `reduceToVectors`, buffers them by 300 m to account for GPS uncertainty, and enriches with the following attributes for each hotspot polygon:  
-- `peakSeason`: Derived via `.filter(seasons)` to identify the season with maximum crane counts.  
-- `totalCranes`: Total observations per polygon.  
-- `inReserve`: Checks overlap with `natural_reserves`.  
+ - `peakSeason`: Derived via `.filter(seasons)` to identify the season with maximum crane counts.  
+ - `totalCranes`: Total observations per polygon.  
+ - `inReserve`: Checks overlap with `natural_reserves`.  
 
 ```js
 // B3: Vectorize & Enrich Hotspots
@@ -445,7 +446,7 @@ function addInfoRow(name, widget) {
 }
 ```
 
-`C4-C5`** Updates province options and overlays province boundaries (`provincesOutlineImage`) on country selection for more detailed jurisdiction selection.
+`C4-C5` updates province options and overlays province boundaries (`provincesOutlineImage`) on country selection for more detailed jurisdiction selection.
 
 ```js
 // C4: Populate countries (Step 1)
